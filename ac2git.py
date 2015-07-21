@@ -201,7 +201,12 @@ class Config(object):
             logFilename = None
             logFileElem = xmlRoot.find('logfile')
             if logFileElem is not None:
-                logFilename = logFileElem.text
+                logFilename = logFileElem.text.strip()
+
+            msgFormat = None
+            msgFormatElem = xmlRoot.find('message-format')
+            if msgFormatElem is not None:
+                msgFormat = msgFormatElem.text.strip()
 
             usermaps = []
             userMapsElem = xmlRoot.find('usermaps')
@@ -209,7 +214,7 @@ class Config(object):
                 for userMapElem in userMapsElem.findall('map-user'):
                     usermaps.append(Config.UserMap.fromxmlelement(userMapElem))
             
-            return cls(accurev=accurev, git=git, usermaps=usermaps, logFilename=logFilename)
+            return cls(accurev=accurev, git=git, usermaps=usermaps, logFilename=logFilename, messageFormat=msgFormat)
         else:
             # Invalid XML for an accurev2git configuration file.
             return None
@@ -224,12 +229,13 @@ class Config(object):
         
         return config
 
-    def __init__(self, accurev = None, git = None, usermaps = None, logFilename = None):
-        self.accurev     = accurev
-        self.git         = git
-        self.usermaps    = usermaps
-        self.logFilename = logFilename
-        self.logger      = Config.Logger()
+    def __init__(self, accurev = None, git = None, usermaps = None, logFilename = None, messageFormat = None):
+        self.accurev       = accurev
+        self.git           = git
+        self.usermaps      = usermaps
+        self.logFilename   = logFilename
+        self.messageFormat = messageFormat
+        self.logger        = Config.Logger()
         
     def __repr__(self):
         str = "Config(accurev=" + repr(self.accurev)
@@ -471,6 +477,10 @@ class AccuRev2Git(object):
         # Make the first commit
         messageFilePath = os.path.join(self.cwd, 'commit_message')
         with codecs.open(messageFilePath, 'w', "utf-8") as messageFile:
+            messageFormat = self.config.messageFormat
+            if messageFormat is None:
+                messageFormat = "{accurev_comment}"
+
             if transaction.comment is None or len(transaction.comment) == 0:
                 messageFile.write(' ') # White-space is always stripped from commit messages. See the git commit --cleanup option for details.
             else:
@@ -544,6 +554,12 @@ class AccuRev2Git(object):
                         deletedPathList.append(path)
 
         return deletedPathList 
+
+    def BuildMessageTokenDictionary(self, transaction, streamName, branchName, depotName):
+        tokens = OrderedDict()
+        tokens['empty'] = ''
+        if transaction is not None:
+            tokens['accurev_comment'] = transaction.comment
 
     def ProcessStream(self, depot, streamName, branchName, startTransaction, endTransaction):
         self.config.logger.info( "Processing {0}".format(streamName) )
@@ -930,6 +946,30 @@ def DumpExampleConfigFile(outputFilename):
     </accurev>
     <git repo-path="/put/the/git/repo/here" /> <!-- The system path where you want the git repo to be populated. Note: this folder should already exist. -->
     <logfile>accurev2git.log<logfile>
+    <!-- The <message-format /> is optional. If it is missing from the config file the default message will be the accurev comment. If it is empty all commit messages will be empty. 
+         The message format is stripped of leading and trailing spaces and new lines before substitution is applied to the following elements:
+           {empty}                     - Replaced by the empty string. Can be used to force leading or trailing whitespace.
+           {stream_name}               - The name of the accurev stream which is currently being processed.
+           {stream_number}             - The number of the accurev stream which is currently being processed.
+           {branch_name}               - The name of the git branch on which this is being committed. This is the {stream_name} mapped to its git branch via this config file.
+           {depot_name}                - The name of the depot which is currently being processed.
+           {transaction_comment}       - Replaced by the full accurev comment for the transaction. Can be empty for certain transactions.
+           {transaction_stream_name}   - The name of the stream in which this transaction occurred. 
+                                         i.e. A promote to a parent stream will appear as a commit in the child stream as well. This is the name of 
+                                         the parent stream, while {stream_name} and {stream_number} refer to the child stream that we are currently processing.
+           {transaction_stream_number} - The number of the stream in which this transaction occurred. See {transaction_stream_name} for details.
+           {transaction_number}        - The number of the transaction.
+           {transaction_type}          - The type of the transaction. e.g. mkstream, promote
+           {transaction_username}      - The accurev username of the user who made the accurev transaction.
+           {accurev_diff}              - The output of the accurev diff command between this and last processed transaction for this branch. 
+                                         i.e. `accurev diff -a -i -v {stream_name} -V {stream_name} -t <previous_transaction_number>-{transaction_number}`.
+           {accurev_hist}              - The output of the accurev hist command for this transaction. e.g. accurev hist -p {depot_name} -t {transaction_number}.1
+    -->
+    <message-format>
+        {stream_name}: {transaction_stream_name}/{transaction_number}
+
+        {accurev_comment}
+    </message-format>
     <!-- The user maps are used to convert users from AccuRev into git. Please spend the time to fill them in properly. -->
     <usermaps>
         <!-- The timezone attribute is optional. All times are retrieved in UTC from AccuRev and will converted to the local timezone by default.
