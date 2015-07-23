@@ -434,9 +434,11 @@ class AccuRev2Git(object):
 
         return tr
 
-    def GetLastCommitHash(self):
+    def GetLastCommitHash(self, branchName=None):
         for i in xrange(0, 3):
             cmd = [u'git', u'log', u'-1', u'--format=format:%H']
+            if branchName is not None:
+                cmd.append(branchName)
             commitHash = self.gitRepo.raw_cmd(cmd)
             if commitHash is not None:
                 commitHash = commitHash.strip()
@@ -450,13 +452,18 @@ class AccuRev2Git(object):
 
     def GetHistForCommit(self, commitHash):
         hist = None
-        lastHistXml = self.gitRepo.notes.show(obj=commitHash, ref=AccuRev2Git.gitNotesRef_AccurevHistXml)
+        for i in xrange(0, 3):
+            lastHistXml = self.gitRepo.notes.show(obj=commitHash, ref=AccuRev2Git.gitNotesRef_AccurevHistXml)
+            if lastHistXml is not None:
+                break
+
         if lastHistXml is not None:
             lastHistXml = lastHistXml.strip().encode('utf-8')
             hist = accurev.obj.History.fromxmlstring(lastHistXml)
         else:
             self.config.logger.error("Failed to load the last transaction for commit {0} from {1} notes.".format(commitHash, AccuRev2Git.gitNotesRef_AccurevHistXml))
             self.config.logger.error("  i.e git notes --ref={0} show {1}    - returned nothing.".format(AccuRev2Git.gitNotesRef_AccurevHistXml, commitHash))
+
         return hist
 
     def CreateCleanGitBranch(self, branchName):
@@ -468,7 +475,7 @@ class AccuRev2Git(object):
         self.gitRepo.rm(fileList=['.'], force=True, recursive=True)
         self.ClearGitRepo()
 
-    def Commit(self, depot, transaction):
+    def Commit(self, depot, transaction, isFirstCommit=False):
         self.PreserveEmptyDirs()
 
         # Add all of the files to the index
@@ -490,7 +497,10 @@ class AccuRev2Git(object):
         
         committer = self.GetGitUserFromAccuRevUser(transaction.user)
         committerDate, committerTimezone = self.GetGitDatetime(accurevUsername=transaction.user, accurevDatetime=transaction.time)
-        lastCommitHash = self.GetLastCommitHash()
+        if not isFirstCommit:
+            lastCommitHash = self.GetLastCommitHash()
+        else:
+            lastCommitHash = None
         commitHash = None
 
         # Since the accurev.obj namespace is populated from the XML output of accurev commands all times are given in UTC.
@@ -526,18 +536,31 @@ class AccuRev2Git(object):
         os.remove(messageFilePath)
 
         return commitHash
+
+    def TryDiff(self, streamName, firstTrNumber, secondTrNumber):
+        for i in xrange(0, 3):
+            diff = accurev.diff(all=True, informationOnly=True, verSpec1=streamName, verSpec2=streamName, transactionRange="{0}-{1}".format(firstTrNumber, secondTrNumber))
+            if diff is not None:
+                break
+        if diff is None:
+            self.config.logger.error( "accurev diff failed! stream: {0} time-spec: {1}-{2}".format(streamName, startTrNumber, endTrNumber) )
+        return diff
     
     def FindNextChangeTransaction(self, streamName, startTrNumber, endTrNumber):
         # Iterate over transactions in order using accurev diff -a -i -v streamName -V streamName -t <lastProcessed>-<current iterator>
         nextTr = startTrNumber + 1
-        diff = accurev.diff(all=True, informationOnly=True, verSpec1=streamName, verSpec2=streamName, transactionRange="{0}-{1}".format(startTrNumber, nextTr))
+        diff = self.TryDiff(streamName=streamName, firstTrNumber=startTrNumber, secondTrNumber=nextTr)
+        if diff is None:
+            return (None, None)
 
         # Note: This is likely to be a hot path. However, it cannot be optimized since a revert of a transaction would not show up in the diff even though the
         #       state of the stream was changed during that period in time. Hence to be correct we must iterate over the transactions one by one unless we have
         #       explicit knowlege of all the transactions which could affect us via some sort of deep history option...
         while nextTr <= endTrNumber and len(diff.elements) == 0:
             nextTr += 1
-            diff = accurev.diff(all=True, informationOnly=True, verSpec1=streamName, verSpec2=streamName, transactionRange="{0}-{1}".format(startTrNumber, nextTr))
+            diff = self.TryDiff(streamName=streamName, firstTrNumber=startTrNumber, secondTrNumber=nextTr)
+            if diff is None:
+                return (None, None)
         
         return (nextTr, diff)
 
@@ -561,6 +584,21 @@ class AccuRev2Git(object):
         if transaction is not None:
             tokens['accurev_comment'] = transaction.comment
 
+    def TryPop(self, streamName, transaction):
+        for i in xrange(0, 3):
+            popResult = accurev.pop(verSpec=streamName, location=self.gitRepo.path, isRecursive=True, timeSpec=transaction.id, elementList='.')
+            if popResult:
+                break
+            else:
+                self.config.logger.error("accurev pop failed:")
+                for message in popResult.messages:
+                    if message.error is not None and message.error:
+                        self.config.logger.error("  {0}".format(message.text))
+                    else:
+                        self.config.logger.info("  {0}".format(message.text))
+        
+        return popResult
+
     def ProcessStream(self, depot, streamName, branchName, startTransaction, endTransaction):
         self.config.logger.info( "Processing {0}".format(streamName) )
 
@@ -570,45 +608,48 @@ class AccuRev2Git(object):
             if branchName == b.name:
                 branch = b
                 break
+
+        status = None
+        if branch is not None:
+            # Get the last processed transaction
+            self.ClearGitRepo()
+            self.gitRepo.checkout(branchName=branchName)
+            status = self.gitRepo.status()
+
         tr = None
         commitHash = None
-        if branch is None:
+        if status is None or status.initial_commit:
             # We are tracking a new stream:
             tr = self.GetFirstTransaction(depot=depot, streamName=streamName, startTransaction=startTransaction, endTransaction=endTransaction)
             if tr is not None:
-                self.CreateCleanGitBranch(branchName=branchName)
+                if branch is None:
+                    self.CreateCleanGitBranch(branchName=branchName)
                 try:
                     destStream = tr.versions[0].virtualNamedVersion.stream
                 except:
                     destStream = None
                 self.config.logger.dbg( "{0} pop (init): {1} {2}{3}".format(streamName, tr.Type, tr.id, " to {0}".format(destStream) if destStream is not None else "") )
-                popResult = accurev.pop(verSpec=streamName, location=self.gitRepo.path, isRecursive=True, timeSpec=tr.id, elementList='.')
+                popResult = self.TryPop(streamName=streamName, transaction=tr)
                 if not popResult:
-                    self.config.logger.error("accurev pop failed:")
-                    for message in popResult.messages:
-                        if message.error is not None and message.error:
-                            self.config.logger.error("  {0}".format(message.text))
-                        else:
-                            self.config.logger.info("  {0}".format(message.text))
-                    return
+                    return (None, None)
                 
-                commitHash = self.Commit(depot=depot, transaction=tr)
+                commitHash = self.Commit(depot=depot, transaction=tr, isFirstCommit=True)
                 if not commitHash:
                     self.config.logger.dbg( "{0} first commit has failed. Is it an empty commit? Continuing...".format(streamName) )
                 else:
                     self.config.logger.info( "stream {0}: tr. #{1} {2} into {3} -> commit {4} on {5}".format(streamName, tr.id, tr.Type, destStream if destStream is not None else 'unknown', commitHash[:8], branchName) )
             else:
-                return
+                return (None, None)
         else:
             # Get the last processed transaction
-            self.ClearGitRepo()
-            self.gitRepo.checkout(branchName=branchName)
-            commitHash = self.GetLastCommitHash()
+            commitHash = self.GetLastCommitHash(branchName=branchName)
             hist = self.GetHistForCommit(commitHash=commitHash)
+
             if hist is None:
                 self.config.logger.error("Repo in invalid state. Please reset this branch to a previous commit with valid notes.")
-                self.config.logger.error("  e.g. git reset --soft {0}~1".format(branchName))
-                return
+                self.config.logger.error("  e.g. git reset --hard {0}~1".format(branchName))
+                return (None, None)
+
             tr = hist.transactions[0]
             self.config.logger.dbg("{0}: last processed transaction was #{1}".format(streamName, tr.id))
 
@@ -618,6 +659,9 @@ class AccuRev2Git(object):
 
         while True:
             nextTr, diff = self.FindNextChangeTransaction(streamName=streamName, startTrNumber=tr.id, endTrNumber=endTr.id)
+            if nextTr is None or diff is None:
+                self.config.logger.dbg( "FindNextChangeTransaction(streamName='{0}', startTrNumber={1}, endTrNumber={2}) failed!".format(streamName, startTrNumber, endTrNumber) )
+                return (None, None)
 
             self.config.logger.dbg( "{0}: next transaction {1}".format(streamName, nextTr) )
             if nextTr <= endTr.id:
@@ -634,7 +678,9 @@ class AccuRev2Git(object):
                 # Populate
                 destStream = self.GetDestinationStreamName(history=hist)
                 self.config.logger.dbg( "{0} pop: {1} {2}{3}".format(streamName, tr.Type, tr.id, " to {0}".format(destStream) if destStream is not None else "") )
-                accurev.pop(verSpec=streamName, location=self.gitRepo.path, isRecursive=True, timeSpec=tr.id, elementList='.')
+                popResult = self.TryPop(streamName=streamName, transaction=tr)
+                if not popResult:
+                    return (None, None)
 
                 # Commit
                 commitHash = self.Commit(depot=depot, transaction=tr)
@@ -664,7 +710,9 @@ class AccuRev2Git(object):
         for stream in self.config.accurev.streamMap:
             branch = self.config.accurev.streamMap[stream]
             depot  = self.config.accurev.depot
-            self.ProcessStream(depot=depot, streamName=stream, branchName=branch, startTransaction=self.config.accurev.startTransaction, endTransaction=self.config.accurev.endTransaction)
+            tr, commitHash = self.ProcessStream(depot=depot, streamName=stream, branchName=branch, startTransaction=self.config.accurev.startTransaction, endTransaction=self.config.accurev.endTransaction)
+            if tr is None or commitHash is None:
+                self.config.logger.error( "Error while processing stream {0}, branch {1}".format(streamName, branch) )
 
     def InitGitRepo(self, gitRepoPath):
         gitRootDir, gitRepoDir = os.path.split(gitRepoPath)
