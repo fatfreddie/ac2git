@@ -273,19 +273,16 @@ class AccuRev2Git(object):
         self.cwd = None
         self.gitRepo = None
         self.gitBranchList = None
- 
+
+    # Returns True if the path was deleted, otherwise false
     def DeletePath(self, path):
         if os.path.exists(path):
             if os.path.isdir(path):
-                for root, dirs, files in os.walk(path, topdown=False):
-                    for name in files:
-                        p = os.path.join(root, name)
-                        os.remove(p)
-                    for name in dirs:
-                        p = os.path.join(root, name)
-                        os.rmdir(p)
+                shutil.rmtree(path)
             elif os.path.isfile(path):
                 os.remove(path)
+            
+        return not os.path.exists(path)
    
     def ClearGitRepo(self):
         # Delete everything except the .git folder from the destination (git repo)
@@ -300,6 +297,7 @@ class AccuRev2Git(object):
                     os.rmdir(path)
 
     def PreserveEmptyDirs(self):
+        preservedDirs = []
         for root, dirs, files in os.walk(self.gitRepo.path, topdown=True):
             for name in dirs:
                 path = os.path.join(root, name).replace('\\','/')
@@ -308,9 +306,32 @@ class AccuRev2Git(object):
                     filename = os.path.join(path, '.gitignore')
                     with codecs.open(filename, 'w', 'utf-8') as file:
                         #file.write('# accurev2git.py preserve empty dirs\n')
-                        pass
+                        preservedDirs.append(filename)
                     if not os.path.exists(filename):
-                        self.config.logger.error("Failed to preserve directory. Couldn't create {0}.".format(filename))
+                        self.config.logger.error("Failed to preserve directory. Couldn't create '{0}'.".format(filename))
+        return preservedDirs
+
+    def DeleteEmptyDirs(self):
+        deletedDirs = []
+        for root, dirs, files in os.walk(self.gitRepo.path, topdown=True):
+            for name in dirs:
+                path = os.path.join(root, name).replace('\\','/')
+                # Delete empty directories that are not under the .git/ directory.
+                if git.GetGitDirPrefix(path) is None:
+                    dirlist = os.listdir(path)
+                    count = len(dirlist)
+                    delete = (len(dirlist) == 0)
+                    if len(dirlist) == 1 and '.gitignore' in dirlist:
+                        with codecs.open(os.path.join(path, '.gitignore')) as gi:
+                            contents = gi.read().strip()
+                            delete = (len(contents) == 0)
+                    if delete:
+                        if not self.DeletePath(path):
+                            self.config.logger.error("Failed to delete empty directory '{0}'.".format(path))
+                            raise Exception("Failed to delete '{0}'".format(path))
+                        else:
+                            deletedDirs.append(path)
+        return deletedDirs
 
     def GetGitUserFromAccuRevUser(self, accurevUsername):
         if accurevUsername is not None:
@@ -381,7 +402,7 @@ class AccuRev2Git(object):
                 gitDatetimeStr = "{0} {1:+05}".format(gitDatetimeStr, tz)
         return gitDatetimeStr
 
-    def AddAccurevHistNote(self, commitHash, ref, depot, transaction, isXml=False):
+    def AddAccurevHistNote(self, commitHash, ref, depot, transaction, committer=None, committerDate=None, committerTimezone=None, isXml=False):
         # Write the commit notes consisting of the accurev hist xml output for the given transaction.
         # Note: It is important to use the depot instead of the stream option for the accurev hist command since if the transaction
         #       did not occur on that stream we will get the closest transaction that was a promote into the specified stream instead of an error!
@@ -394,7 +415,7 @@ class AccuRev2Git(object):
             else:
                 notesFile.write(arHistXml.decode("utf-8"))
 
-        rv = self.gitRepo.notes.add(messageFile=notesFilePath, obj=commitHash, ref=ref, force=True)
+        rv = self.gitRepo.notes.add(messageFile=notesFilePath, obj=commitHash, ref=ref, force=True, committer=committer, committerDate=committerDate, committerTimezone=committerTimezone, author=committer, authorDate=committerDate, authorTimezone=committerTimezone)
         
         if rv is not None:
             os.remove(notesFilePath)
@@ -467,12 +488,30 @@ class AccuRev2Git(object):
 
         return commitHash
 
-    def GetHistForCommit(self, commitHash):
+    def GetHistForCommit(self, commitHash, branchName=None):
         hist = None
-        for i in xrange(0, AccuRev2Git.commandFailureRetryCount):
-            lastHistXml = self.gitRepo.notes.show(obj=commitHash, ref=AccuRev2Git.gitNotesRef_AccurevHistXml)
+        lastHistXml = None
+
+        # Try and search the branch namespace.
+        if branchName is not None:
+            for i in xrange(0, AccuRev2Git.commandFailureRetryCount):
+                lastHistXml = self.gitRepo.notes.show(obj=commitHash, ref=branchName)
+                if lastHistXml is not None:
+                    break
+
             if lastHistXml is not None:
-                break
+                lastHistXml = lastHistXml.strip().encode('utf-8')
+                hist = accurev.obj.History.fromxmlstring(lastHistXml)
+            else:
+                self.config.logger.error("Failed to load the last transaction for commit {0} from {1} notes.".format(commitHash, branchName))
+                self.config.logger.error("  i.e git notes --ref={0} show {1}    - returned nothing.".format(branchName, commitHash))
+
+        # If the branch namespace doesn't work try the default one.
+        if lastHistXml is None:
+            for i in xrange(0, AccuRev2Git.commandFailureRetryCount):
+                lastHistXml = self.gitRepo.notes.show(obj=commitHash, ref=AccuRev2Git.gitNotesRef_AccurevHistXml)
+                if lastHistXml is not None:
+                    break
 
         if lastHistXml is not None:
             lastHistXml = lastHistXml.strip().encode('utf-8')
@@ -492,7 +531,7 @@ class AccuRev2Git(object):
         self.gitRepo.rm(fileList=['.'], force=True, recursive=True)
         self.ClearGitRepo()
 
-    def Commit(self, depot, transaction, isFirstCommit=False):
+    def Commit(self, depot, transaction, branchName=None, isFirstCommit=False):
         self.PreserveEmptyDirs()
 
         # Add all of the files to the index
@@ -533,7 +572,11 @@ class AccuRev2Git(object):
                     self.config.logger.dbg( "Committed {0}".format(commitHash) )
                     xmlNoteWritten = False
                     for i in xrange(0, AccuRev2Git.commandFailureRetryCount):
-                        xmlNoteWritten = ( self.AddAccurevHistNote(commitHash=commitHash, ref=AccuRev2Git.gitNotesRef_AccurevHistXml, depot=depot, transaction=transaction, isXml=True) is not None )
+                        ref = branchName
+                        if ref is None:
+                            ref = AccuRev2Git.gitNotesRef_AccurevHistXml
+                            self.config.logger.error("Commit to an unspecified branch. Using default `git notes` ref for the script [{0}] at current time.".format(ref))
+                        xmlNoteWritten = ( self.AddAccurevHistNote(commitHash=commitHash, ref=ref, depot=depot, transaction=transaction, isXml=True, committerDate=committerDate, committerTimezone=committerTimezone) is not None )
                         if xmlNoteWritten:
                             break
                     if not xmlNoteWritten:
@@ -544,7 +587,7 @@ class AccuRev2Git(object):
                         self.gitRepo.raw_cmd([u'git', u'reset', u'--hard', u'{0}^'.format(branchName)])
 
                         return None
-                    self.AddAccurevHistNote(commitHash=commitHash, ref=AccuRev2Git.gitNotesRef_AccurevHist, depot=depot, transaction=transaction, isXml=False)
+                    #self.AddAccurevHistNote(commitHash=commitHash, ref=AccuRev2Git.gitNotesRef_AccurevHist, depot=depot, transaction=transaction, isXml=False)
                 else:
                     self.config.logger.error("Commit command returned True when nothing was committed...? Last commit hash {0} didn't change after the commit command executed.".format(lastCommitHash))
                     return None
@@ -596,8 +639,11 @@ class AccuRev2Git(object):
                     if stream is not None and stream.name is not None:
                         name = stream.name.replace('\\', '/').lstrip('/')
                         path = os.path.join(self.gitRepo.path, name)
-                        self.DeletePath(path)
-                        deletedPathList.append(path)
+                        if not self.DeletePath(path):
+                            self.config.logger.error("Failed to delete '{0}'.".format(path))
+                            raise Exception("Failed to delete '{0}'".format(path))
+                        else:
+                            deletedPathList.append(path)
 
         return deletedPathList
 
@@ -614,9 +660,9 @@ class AccuRev2Git(object):
         if transaction is not None:
             tokens['accurev_comment'] = transaction.comment
 
-    def TryPop(self, streamName, transaction):
+    def TryPop(self, streamName, transaction, overwrite=False):
         for i in xrange(0, AccuRev2Git.commandFailureRetryCount):
-            popResult = accurev.pop(verSpec=streamName, location=self.gitRepo.path, isRecursive=True, timeSpec=transaction.id, elementList='.')
+            popResult = accurev.pop(verSpec=streamName, location=self.gitRepo.path, isRecursive=True, isOverride=overwrite, timeSpec=transaction.id, elementList='.')
             if popResult:
                 break
             else:
@@ -659,11 +705,11 @@ class AccuRev2Git(object):
                 except:
                     destStream = None
                 self.config.logger.dbg( "{0} pop (init): {1} {2}{3}".format(streamName, tr.Type, tr.id, " to {0}".format(destStream) if destStream is not None else "") )
-                popResult = self.TryPop(streamName=streamName, transaction=tr)
+                popResult = self.TryPop(streamName=streamName, transaction=tr, overwrite=True)
                 if not popResult:
                     return (None, None)
                 
-                commitHash = self.Commit(depot=depot, transaction=tr, isFirstCommit=True)
+                commitHash = self.Commit(depot=depot, transaction=tr, branchName=branchName, isFirstCommit=True)
                 if not commitHash:
                     self.config.logger.dbg( "{0} first commit has failed. Is it an empty commit? Continuing...".format(streamName) )
                 else:
@@ -674,7 +720,7 @@ class AccuRev2Git(object):
         else:
             # Get the last processed transaction
             commitHash = self.GetLastCommitHash(branchName=branchName)
-            hist = self.GetHistForCommit(commitHash=commitHash)
+            hist = self.GetHistForCommit(commitHash=commitHash, branchName=branchName)
 
             if hist is None:
                 self.config.logger.error("Repo in invalid state. Please reset this branch to a previous commit with valid notes.")
@@ -701,7 +747,16 @@ class AccuRev2Git(object):
             if nextTr <= endTr.id:
                 # Right now nextTr is an integer representation of our next transaction.
                 # Delete all of the files which are even mentioned in the diff so that we can do a quick populate (wouth the overwrite option)
-                deletedPathList = self.DeleteDiffItemsFromRepo(diff=diff)
+                try:
+                    popOverwrite = False
+                    deletedPathList = self.DeleteDiffItemsFromRepo(diff=diff)
+                except:
+                    popOverwrite = True
+                    self.config.logger.info("Error trying to delete changed elements. Fatal, aborting!")
+                    # This might be ok only in the case when the files/directories were changed but not in the case when there
+                    # was a deletion that occurred. Abort and be safe!
+                    # TODO: This must be solved somehow since this could hinder this script from continuing at all!
+                    return (None, None)
 
                 # The accurev hist command here must be used with the depot option since the transaction that has affected us may not
                 # be a promotion into the stream we are looking at but into one of its parent streams. Hence we must query the history
@@ -715,12 +770,24 @@ class AccuRev2Git(object):
                 # Populate
                 destStream = self.GetDestinationStreamName(history=hist)
                 self.config.logger.dbg( "{0} pop: {1} {2}{3}".format(streamName, tr.Type, tr.id, " to {0}".format(destStream) if destStream is not None else "") )
-                popResult = self.TryPop(streamName=streamName, transaction=tr)
+
+                # Remove all the empty directories (this includes directories which contain an empty .gitignore file since that's what we is done to preserve them)
+                try:
+                    self.DeleteEmptyDirs()
+                except:
+                    popOverwrite = True
+                    self.config.logger.info("Error trying to delete empty directories. Fatal, aborting!")
+                    # This might be ok only in the case when the files/directories were changed but not in the case when there
+                    # was a deletion that occurred. Abort and be safe!
+                    # TODO: This must be solved somehow since this could hinder this script from continuing at all!
+                    return (None, None)
+
+                popResult = self.TryPop(streamName=streamName, transaction=tr, overwrite=popOverwrite)
                 if not popResult:
                     return (None, None)
 
                 # Commit
-                commitHash = self.Commit(depot=depot, transaction=tr)
+                commitHash = self.Commit(depot=depot, transaction=tr, branchName=branchName, isFirstCommit=False)
                 if commitHash is None:
                     if"nothing to commit" in self.gitRepo.lastStdout:
                         self.config.logger.error( "diff info ({0} elements):".format(len(diff.elements)) )
