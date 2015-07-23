@@ -576,7 +576,7 @@ class AccuRev2Git(object):
                         if ref is None:
                             ref = AccuRev2Git.gitNotesRef_AccurevHistXml
                             self.config.logger.error("Commit to an unspecified branch. Using default `git notes` ref for the script [{0}] at current time.".format(ref))
-                        xmlNoteWritten = ( self.AddAccurevHistNote(commitHash=commitHash, ref=ref, depot=depot, transaction=transaction, isXml=True, committerDate=committerDate, committerTimezone=committerTimezone) is not None )
+                        xmlNoteWritten = ( self.AddAccurevHistNote(commitHash=commitHash, ref=ref, depot=depot, transaction=transaction, isXml=True, committer=committer, committerDate=committerDate, committerTimezone=committerTimezone) is not None )
                         if xmlNoteWritten:
                             break
                     if not xmlNoteWritten:
@@ -799,6 +799,9 @@ class AccuRev2Git(object):
                         self.config.logger.error( "deleted {0} files:".format(len(deletedPathList)) )
                         for p in deletedPathList:
                             self.config.logger.error( "  {0}".format(p) )
+                        self.config.logger.error( "populated {0} files:".format(len(popResult.elements)) )
+                        for e in popResult.elements:
+                            self.config.logger.error( "  {0}".format(e.location) )
                         self.config.logger.info("Non-fatal error. Continuing.")
                     else:
                         break # Early return from processing this stream. Restarting should clean everything up.
