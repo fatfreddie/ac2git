@@ -175,6 +175,16 @@ class obj:
                 return obj.TimeSpec.compare_transaction_specs(self.start, self.end) > 0
             except:
                 return False
+
+        def reversed(self):
+            return obj.TimeSpec.reverse(self)
+
+        @classmethod
+        def reverse(cls, timespec):
+            rv = None
+            if isinstance(timespec, cls):
+                rv = cls(start=timespec.end, end=timespec.start, limit=timespec.limit)
+            return rv
         
         @staticmethod
         def parse_simple(timespec):
@@ -197,10 +207,10 @@ class obj:
 
         @classmethod
         def fromstring(cls, string):
-            if TimeSpec.timeSpecRe is None:
-                TimeSpec.timeSpecRe = re.compile(r'^(?P<start>.*?) *(?:- *(?P<end>.*?))?(?:\.(?P<limit>\d+))?$')
+            if obj.TimeSpec.timeSpecRe is None:
+                obj.TimeSpec.timeSpecRe = re.compile(r'^(?P<start>.*?) *(?:- *(?P<end>.*?))?(?:\.(?P<limit>\d+))?$')
 
-            timeSpecMatch = TimeSpec.timeSpecRe.search(string)
+            timeSpecMatch = obj.TimeSpec.timeSpecRe.search(string)
             
             if timeSpecMatch is not None:
                 timeSpecDict = timeSpecMatch.groupdict()
@@ -444,6 +454,25 @@ class obj:
             str += ")"
             
             return str
+
+        # Extension method which returns the name or number of the stream
+        # which is affected by this transaction (the stream on which the
+        # transaction was performed). i.e. A promote to a stream called
+        # Stream1 whose id is 1734 would return ("Stream1", 1734).
+        def affectedStream(self):
+            streamName   = None
+            streamNumber = None
+            if self.versions is not None and len(self.versions) > 0:
+                version = self.versions[0]
+                if version.virtualNamedVersion is not None:
+                    streamName   = version.virtualNamedVersion.stream
+                if version.virtual is not None:
+                    streamNumber = int(version.virtual.stream)
+            elif self.stream is not None:
+                streamName   = self.stream.name
+                streamNumber = self.stream.streamNumber
+
+            return (streamName, streamNumber)
         
         @classmethod
         def fromxmlelement(cls, xmlElement):
@@ -1952,12 +1981,15 @@ class ext(object):
         return parentObjects
 
     @staticmethod
-    def _deep_hist_rec(depot, stream, timeSpec, chstreams, history, parentList):
-        pass
-
-    @staticmethod
+    # Retrieves a list of _all transactions_ which affect the given stream, directly or indirectly (via parent promotes).
+    # Returns a list of obj.Transaction(object) types.
     def deep_hist(depot, stream, timeSpec):
-        ts = obj.TimeSpec.fromstring(timeSpec)
+        if isinstance(timeSpec, obj.TimeSpec):
+            ts = timeSpec
+        elif isinstance(timeSpec, str):
+            ts = obj.TimeSpec.fromstring(timeSpec)
+        else:
+            raise Exception("Unrecognized time-spec type {0}".format(type(timeSpec)))
 
         if ts.end is None or ts.limit == 1:
             # If ts.end is None this means that we are not processing a transaction range.
@@ -1965,60 +1997,81 @@ class ext(object):
             # needed. A simple hist query will do.
             return hist(stream=stream, timeSpec=timeSpec)
 
-        isDesc = ts.is_desc()
-        if not isDesc:
+        if stream is None:
+            raise Exception("ext.deep_hist only makes sense to run on streams that are not None")
+
+        isAsc = ts.is_asc()
+        if not isAsc:
             # Make descending
-            ts = obj.TimeSpec(start=ts.end, end=ts.start, limit=ts.limit)
+            ts = ts.reversed()
         
-        print( ts )
+        # The transaction list that combines all of the transactions which affect this stream.
+        trList = []
 
-        # Get the promote history for the requested stream.
-        history = hist(stream=stream, timeSpec=str(ts), transactionKind='promote')
+        # Get the history for the requested stream.
+        history = hist(depot=depot, stream=stream, timeSpec=str(ts))
 
-        # Get the stream parents from the highest transaction we are looking for.
-        parents = ext.stream_parent_list(depot=depot, stream=stream, transaction=ts.start)
+        prevTr = None
+        parentTs = ts
+        for tr in history.transactions:
+            if tr.Type == "chstream":
+                # Parent stream changed.
+                if prevTr is not None:
+                    parentTs = obj.TimeSpec(start=parentTs.start, end=(tr.id - 1))
+                    # includeDeactevatedItems and includeOldDefinitons might be good to set here...
+                    parentStream = show.streams(depot=depot, stream=stream, timeSpec=parentTs.start).streams[0].basis
+                    if parentStream is not None:
+                        parentTrList = ext.deep_hist(depot=depot, stream=parentStream, timeSpec=parentTs)
+                        trList.extend(parentTrList)
+                    parentTs = obj.TimeSpec(start=tr.id, end=parentTs.end)
 
-        if len(parents) > 1:
-            parentsById = { s.streamNumber: s for s in parents }
+            trList.append(tr)
+            prevTr = tr
 
-            # Check if there are any chstream transactions in the range which could affect this stream
-            # or its parents.
-            chstreams = hist(depot=depot, timeSpec=str(ts), transactionKind='chstream')
+        parentStream = show.streams(depot=depot, stream=stream, timeSpec=parentTs.start).streams[0].basis
+        if parentStream is not None:
+            parentTrList = ext.deep_hist(depot=depot, stream=parentStream, timeSpec=parentTs)
+            trList.extend(parentTrList)
 
-            parentChangelist = []
-            if len(chstreams.transactions) > 0:
-                for tr in chstreams.transactions: # transactions are in descending order
-                    if tr.stream.streamNumber in parentsById:
-                        doAppend = False
+        rv = sorted(trList, key=lambda tr: tr.id)
+        if not isAsc:
+            rv.reverse()
 
-                        # Has the basis changed in our parent-chain?
-                        if tr.stream.prevBasisStreamNumber is not None and tr.stream.basisStreamNumber != tr.stream.prevBasisStreamNumber:
-                            print( 'tr #{0}: {1} stream changed basis {2} -> {3}'.format(tr.id, tr.stream.name, tr.stream.prevBasis, tr.stream.basis) )
-                            # Record the new parents against this transaction in the changelist.
-                            doAppend = True
-                        if tr.stream.time is not None and GetTimestamp(tr.stream.time) != 0:
-                            print( 'tr #{0}: {1} stream changed time lock {2} -> {3}'.format(tr.id, tr.stream.name, tr.stream.prevTime, tr.stream.time) )
-                            doAppend = True
-                        # Has it been renamed? Do we care?
-                        if tr.stream.prevName is not None and tr.stream.name != tr.stream.prevName:
-                            print( 'tr #{0}: stream renamed {2} -> {3}'.format(tr.id, tr.stream.prevName, tr.stream.name) )
+        return rv
 
-                        if doAppend:
-                            parentChangelist.append( (tr, ext.stream_parent_list(depot=depot, stream=stream, transaction=tr.id)) )
+    @staticmethod
+    # Returns a list of streams which are affected by the given transaction.
+    # The transaction must be of type obj.Transaction which is obtained from the obj.History.transactions
+    # which is returned by the hist() function.
+    def affected_streams(depot, transaction, includeWorkspaces=True):
+        if not isinstance(transaction, obj.Transaction):
+            transaction = hist(depot=depot, timeSpec=str(transaction)).transactions[0]
+        
+        rv = None
 
-                #print( chstreams.transactions )
+        destStream = transaction.affectedStream()[0]
 
-            # Get the stream state as it is at the last requested transaction.
+        if destStream is not None:
+            streamMap = ext.stream_dict(depot=depot, transaction=transaction.id)
 
-            # Build a list of stream states for each chstream transaction that is in the range...
-            #print()
-            #print( parents )
+            childrenSet = set()
+            newChildrenSet = set()
 
-        transactions = sorted(history.transactions, key=lambda tr: tr.id)
-        if isDesc:
-            transactions.reverse()
+            newChildrenSet.add(destStream)
+            while len(newChildrenSet) > 0:
+                childrenSet |= newChildrenSet
+                newChildrenSet = set()
 
-        return transactions
+                for stream in streamMap:
+                    if streamMap[stream].basis in childrenSet and stream not in childrenSet:
+                        if includeWorkspaces or streamMap[stream].Type.lower() != "workspace":
+                            newChildrenSet.add(stream)
+            
+            rv = []
+            for stream in childrenSet:
+                rv.append(streamMap[stream])
+            
+        return rv
 
 # ################################################################################################ #
 # Script Main                                                                                      #
