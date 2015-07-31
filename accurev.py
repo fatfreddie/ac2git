@@ -1984,6 +1984,8 @@ class ext(object):
     # Retrieves a list of _all transactions_ which affect the given stream, directly or indirectly (via parent promotes).
     # Returns a list of obj.Transaction(object) types.
     def deep_hist(depot=None, stream=None, timeSpec='now'):
+        # Validate arguments
+        # ==================
         if stream is None:
             # When the stream is not specified then we just want all the depot transactions for the given time-spec.
             return hist(depot=depot, timeSpec=timeSpec)
@@ -1995,18 +1997,36 @@ class ext(object):
         else:
             raise Exception("Unrecognized time-spec type {0}".format(type(timeSpec)))
 
-        # normalize the timeSpec
+        # Normalize the timeSpec
+        # ======================
+        #   1. Change the accurev keywords (e.g. highest, now) into transaction numbers:
+        #      Note: The keywords highest/now are translated w.r.t. the depot and not the stream.
+        #            Otherwise we might miss later promotes to parent streams...
+        depotName = depot # temporary variable used to avoid needlesly calling show.streams(). otherwise just use depot.
+                          # the later call to show streams is done w.r.t. these values so we can't move it above here and skip this trickery.
+        if isinstance(ts.start, str):
+            if depotName is None:
+                depotName = show.streams(stream=stream).streams[0].depotName
+            ts.start = hist(depot=depotName, timeSpec=ts.start).transactions[0].id
+        if isinstance(ts.end, str):
+            if depotName is None:
+                depotName = show.streams(stream=stream).streams[0].depotName
+            ts.end = hist(depot=depotName, timeSpec=ts.end).transactions[0].id
+        #   2. If there is a limit set on the number of transactions convert it into a start and end without a limit...
         if ts.limit is not None:
             if ts.end is None or ts.end - ts.start >= ts.limit:
                 ts.end = ts.start - ts.limit + 1
+            ts.limit = None
         elif ts.end is None:
             ts.end = ts.start
-
+        #   3. Finally, we must ensure that the transactions are traversed in ascending order.
         isAsc = ts.is_asc()
         if not isAsc:
             # Make descending
             ts = ts.reversed()
 
+        # Perform deep-hist algorithm
+        # ===========================
         # The transaction list that combines all of the transactions which affect this stream.
         trList = []
 
@@ -2045,7 +2065,7 @@ class ext(object):
     # Returns a list of streams which are affected by the given transaction.
     # The transaction must be of type obj.Transaction which is obtained from the obj.History.transactions
     # which is returned by the hist() function.
-    def affected_streams(depot, transaction, includeWorkspaces=True):
+    def affected_streams(depot, transaction, includeWorkspaces=True, ignoreTimelocks=True):
         if not isinstance(transaction, obj.Transaction):
             transaction = hist(depot=depot, timeSpec=str(transaction)).transactions[0]
         
@@ -2067,7 +2087,8 @@ class ext(object):
                 for stream in streamMap:
                     if streamMap[stream].basis in childrenSet and stream not in childrenSet:
                         if includeWorkspaces or streamMap[stream].Type.lower() != "workspace":
-                            newChildrenSet.add(stream)
+                            if ignoreTimelocks or streamMap[stream].time is None or streamMap[stream].time >= transaction.time:
+                                newChildrenSet.add(stream)
             
             rv = []
             for stream in childrenSet:
@@ -2082,33 +2103,25 @@ import sys
 import argparse
 
 def clDeepHist(args):
-    try:
-        transactions = ext.deep_hist(depot=args.depot, stream=args.stream, timeSpec=args.timeSpec)
-        if transactions is not None and len(transactions) > 0:
-            print("tr. type; destination stream; tr. number; username;")
-            for tr in transactions:
-                print("{Type}; {stream}; {id}; {user};".format(id=tr.id, user=tr.user, Type=tr.Type, stream=tr.affectedStream()[0]))
-            return 0
-        else:
-            print("No affected streams")
-            return 1
-    except:
-        print("Script exception!")
+    transactions = ext.deep_hist(depot=args.depot, stream=args.stream, timeSpec=args.timeSpec)
+    if transactions is not None and len(transactions) > 0:
+        print("tr. type; destination stream; tr. number; username;")
+        for tr in transactions:
+            print("{Type}; {stream}; {id}; {user};".format(id=tr.id, user=tr.user, Type=tr.Type, stream=tr.affectedStream()[0]))
+        return 0
+    else:
+        print("No affected streams")
         return 1
 
 def clAffectedStreams(args):
-    try:
-        streams = ext.affected_streams(depot=args.depot, transaction=args.transaction, includeWorkspaces=args.includeWorkspaces)
-        if streams is not None and len(streams) > 0:
-            print("stream name; stream id; stream type;")
-            for s in streams:
-                print("{streamName}; {streamId}; {Type};".format(streamName=s.name, streamId=s.streamNumber, Type=s.Type))
-            return 0
-        else:
-            print("No affected streams")
-            return 1
-    except:
-        print("Script exception!")
+    streams = ext.affected_streams(depot=args.depot, transaction=args.transaction, includeWorkspaces=args.includeWorkspaces, ignoreTimelocks=args.ignoreTimelocks)
+    if streams is not None and len(streams) > 0:
+        print("stream name; stream id; stream type;")
+        for s in streams:
+            print("{streamName}; {streamId}; {Type};".format(streamName=s.name, streamId=s.streamNumber, Type=s.Type))
+        return 0
+    else:
+        print("No affected streams")
         return 1
 
 if __name__ == "__main__":
@@ -2120,8 +2133,8 @@ if __name__ == "__main__":
     # deep hist subcommand
     deepHistParser = subparsers.add_parser('deep-hist', help='Shows all the transactions that could have affected the current stream.')
     deepHistParser.description = 'Shows all the transactions that could have affected the current stream.'
-    deepHistParser.add_argument('-p', '--depot',     dest='depot',    required=True, help='The name of the depot in which the transaction occurred')
-    deepHistParser.add_argument('-s', '--stream',    dest='stream',   required=True, help='The accurev stream for which we want to know all the transactions which could have affected it.')
+    deepHistParser.add_argument('-p', '--depot',     dest='depot',    help='The name of the depot in which the transaction occurred')
+    deepHistParser.add_argument('-s', '--stream',    dest='stream',   help='The accurev stream for which we want to know all the transactions which could have affected it.')
     deepHistParser.add_argument('-t', '--time-spec', dest='timeSpec', required=True, help='The accurev time-spec. e.g. 17-21 or 99.')
 
     deepHistParser.set_defaults(func=clDeepHist)
@@ -2133,6 +2146,7 @@ if __name__ == "__main__":
     affectedStreamsParser.add_argument('-p', '--depot',     dest='depot',    required=True, help='The name of the depot in which the transaction occurred')
     affectedStreamsParser.add_argument('-t', '--transaction', dest='transaction', required=True, help='The accurev transaction number for which we want to know the affected streams.')
     affectedStreamsParser.add_argument('-w', '--include-workspaces', dest='includeWorkspaces', action='store_true', default=False, help='The returned set of streams will include workspaces if this option is specified.')
+    affectedStreamsParser.add_argument('-i', '--ignore-timelocks', dest='ignoreTimelocks', action='store_true', default=False, help='The returned set of streams will include streams whose timelocks would have otherwise prevented this stream from affecting them.')
 
     affectedStreamsParser.set_defaults(func=clAffectedStreams)
 
