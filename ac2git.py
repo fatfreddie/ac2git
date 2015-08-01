@@ -646,10 +646,14 @@ class AccuRev2Git(object):
                     diff = self.TryDiff(streamName=streamName, firstTrNumber=startTrNumber, secondTrNumber=tr.id)
                     if diff is None:
                         return (None, None)
-                    self.config.logger.dbg("FindNextChangeTransaction deep-hist: {0}".format(tr.id))
-                    return (tr.id, diff)
+                    elif len(diff.elements) > 0:
+                        self.config.logger.dbg("FindNextChangeTransaction deep-hist: {0}".format(tr.id))
+                        return (tr.id, diff)
+                    else:
+                        self.config.logger.dbg("FindNextChangeTransaction deep-hist skipping: {0}, diff was empty...".format(tr.id))
+
             diff = self.TryDiff(streamName=streamName, firstTrNumber=startTrNumber, secondTrNumber=endTrNumber)
-            return (endTrNumber, diff)
+            return (endTrNumber + 1, diff) # The end transaction number is inclusive. We need to return the one after it.
         elif self.config.method == "pop":
             self.config.logger.dbg("FindNextChangeTransaction pop: {0}".format(startTrNumber + 1))
             return (startTrNumber + 1, None)
@@ -777,7 +781,7 @@ class AccuRev2Git(object):
                 self.config.logger.dbg( "FindNextChangeTransaction(streamName='{0}', startTrNumber={1}, endTrNumber={2}, deepHist={3}) failed!".format(streamName, tr.id, endTr.id, deepHist) )
                 return (None, None)
 
-            self.config.logger.dbg( "{0}: next transaction {1}".format(streamName, nextTr) )
+            self.config.logger.dbg( "{0}: next transaction {1} (end tr. {2})".format(streamName, nextTr, endTr.id) )
             if nextTr <= endTr.id:
                 # Right now nextTr is an integer representation of our next transaction.
                 # Delete all of the files which are even mentioned in the diff so that we can do a quick populate (wouth the overwrite option)
@@ -906,7 +910,7 @@ class AccuRev2Git(object):
         return None
 
     # Arranges the stream1 and stream2 into a tuple of (parent, child) according to accurev information
-    def GetParentChild(self, stream1, stream2, timeSpec=u'now'):
+    def GetParentChild(self, stream1, stream2, timeSpec=u'now', onlyDirectChild=False):
         parent = None
         child = None
         if stream1 is not None and stream2 is not None:
@@ -917,15 +921,17 @@ class AccuRev2Git(object):
             found = False
             for stream in stream1Children.streams:
                 if stream.name == stream2:
-                    parent = stream1
-                    child = stream2
+                    if not onlyDirectChild or stream.basis == stream1:
+                        parent = stream1
+                        child = stream2
                     found = True
                     break
             if not found:
                 for stream in stream2Children.streams:
                     if stream.name == stream1:
-                        parent = stream2
-                        child = stream1
+                        if not onlyDirectChild or stream.basis == stream2:
+                            parent = stream2
+                            child = stream1
                         break
         return (parent, child)
 
@@ -997,7 +1003,7 @@ class AccuRev2Git(object):
                                     continue
 
                                 # Find which one is the parent of the other. They must be inline since they were affected by the same transaction (since the times match)
-                                parentStream, childStream = self.GetParentChild(stream1=firstStream, stream2=secondStream, timeSpec=firstHist.transactions[0].id)
+                                parentStream, childStream = self.GetParentChild(stream1=firstStream, stream2=secondStream, timeSpec=firstHist.transactions[0].id, onlyDirectChild=True)
                                 if parentStream is None and childStream is None:
                                     # The two streams are unrelated and are probably substreams of a third stream. Hence we should not merge them!
                                     self.config.logger.info(u'  unrelated: {0} ({1}/{2}) is equiv. to {3} ({4}/{5}). tree {6}.'.format(first[u'hash'][:8], firstStream, firstHist.transactions[0].id, second[u'hash'][:8], secondStream, secondHist.transactions[0].id, tree_hash[:8]))
