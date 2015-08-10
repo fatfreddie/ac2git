@@ -645,7 +645,7 @@ class AccuRev2Git(object):
                 if diff is None:
                     return (None, None)
         
-            self.config.logger.dbg("FindNextChangeTransaction diff: {0}".format(tr.id))
+            self.config.logger.dbg("FindNextChangeTransaction diff: {0}".format(nextTr))
             return (nextTr, diff)
         elif self.config.method == "deep-hist":
             if deepHist is None:
@@ -873,7 +873,16 @@ class AccuRev2Git(object):
         for stream in self.config.accurev.streamMap:
             branch = self.config.accurev.streamMap[stream]
             depot  = self.config.accurev.depot
-            streamInfo = accurev.show.streams(depot=depot, stream=stream).streams[0]
+            streamInfo = None
+            try:
+                streamInfo = accurev.show.streams(depot=depot, stream=stream).streams[0]
+            except IndexError:
+                self.config.logger.error( "Failed to get stream information. `accurev show streams -p {0} -s {1}` returned no streams".format(depot, stream) )
+                return
+            except AttributeError:
+                self.config.logger.error( "Failed to get stream information. `accurev show streams -p {0} -s {1}` returned None".format(depot, stream) )
+                return
+
             if depot is None or len(depot) == 0:
                 depot = streamInfo.depotName
             tr, commitHash = self.ProcessStream(depot=depot, stream=streamInfo, branchName=branch, startTransaction=self.config.accurev.startTransaction, endTransaction=self.config.accurev.endTransaction)
