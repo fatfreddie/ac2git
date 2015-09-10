@@ -49,7 +49,17 @@ class Config(object):
         
         def _FormatMessage(self, messages):
             if self.referenceTime is not None:
-                outMessage = "{0: >6.2f}s: ".format(time.clock() - self.referenceTime)
+                #outMessage = "{0: >6.2f}s: ".format((datetime.now() - self.referenceTime).total_seconds()) # Print as total seconds with 2 decimal places.
+                #outMessage = "{0}: ".format(datetime.now() - self.referenceTime) # Print as a timedelta (which has 6 decimal places)
+		# Custom formatting of the timestamp
+		m, s = divmod((datetime.now() - self.referenceTime).total_seconds(), 60)
+		h, m = divmod(m, 60)
+		d, h = divmod(h, 24)
+		outMessage = ""
+		if d > 0:
+		    outMessage += "{d: >2d}d, ".format(d=int(d))
+		
+                outMessage += "{h: >2d}:{m:0>2d}:{s:0>5.2f}# ".format(h=int(h), m=int(m), s=s)
             else:
                 outMessage = ""
             
@@ -294,10 +304,10 @@ class AccuRev2Git(object):
     # Returns True if the path was deleted, otherwise false
     def DeletePath(self, path):
         if os.path.exists(path):
-            if os.path.isdir(path):
-                shutil.rmtree(path)
-            elif os.path.isfile(path):
+            if os.path.islink(path) or os.path.isfile(path):
                 os.remove(path)
+            elif os.path.isdir(path):
+                shutil.rmtree(path)
             
         return not os.path.exists(path)
    
@@ -307,11 +317,11 @@ class AccuRev2Git(object):
             for name in files:
                 path = os.path.join(root, name)
                 if git.GetGitDirPrefix(path) is None:
-                    os.remove(path)
+                    self.DeletePath(path)
             for name in dirs:
                 path = os.path.join(root, name)
                 if git.GetGitDirPrefix(path) is None:
-                    os.rmdir(path)
+                    self.DeletePath(path)
 
     def PreserveEmptyDirs(self):
         preservedDirs = []
@@ -490,7 +500,7 @@ class AccuRev2Git(object):
 
             startTr = startTrHist.transactions[0]
             if tr.id < startTr.id:
-                self.config.logger.info( "The first transaction (#{0}) for strem {1} is earlier than the conversion start transaction (#{2}).".format(tr.id, streamName, startTr.id) )
+                self.config.logger.info( "The first transaction (#{0}) for stream {1} is earlier than the conversion start transaction (#{2}).".format(tr.id, streamName, startTr.id) )
                 tr = startTr
         if endTransaction is not None:
             endTrHist = self.TryHist(depot=depot, trNum=endTransaction)
@@ -499,7 +509,7 @@ class AccuRev2Git(object):
 
             endTr = endTrHist.transactions[0]
             if endTr.id < tr.id:
-                self.config.logger.info( "The first transaction (#{0}) for strem {1} is later than the conversion end transaction (#{2}).".format(tr.id, streamName, startTr.id) )
+                self.config.logger.info( "The first transaction (#{0}) for stream {1} is later than the conversion end transaction (#{2}).".format(tr.id, streamName, startTr.id) )
                 tr = None
 
         return tr
@@ -629,7 +639,7 @@ class AccuRev2Git(object):
                 self.config.logger.error("Failed to commit! No last hash available.")
                 return None
         elif "nothing to commit" in self.gitRepo.lastStdout:
-            self.config.logger.error( "nothing to commit after populating transaction {0}...?".format(transaction.id) )
+            self.config.logger.dbg( "nothing to commit after populating transaction {0}...?".format(transaction.id) )
         else:
             self.config.logger.error( "Failed to commit transaction {0}".format(transaction.id) )
             self.config.logger.error( "\n{0}\n{1}\n".format(self.gitRepo.lastStdout, self.gitRepo.lastStderr) )
@@ -784,10 +794,24 @@ class AccuRev2Git(object):
             commitHash = self.GetLastCommitHash(branchName=branchName)
             hist = self.GetHistForCommit(commitHash=commitHash, branchName=branchName)
 
+            # This code should probably be controlled with some flag in the configuration/command line...
             if hist is None:
-                self.config.logger.error("Repo in invalid state. Please reset this branch to a previous commit with valid notes.")
-                self.config.logger.error("  e.g. git reset --hard {0}~1".format(branchName))
-                return (None, None)
+                self.config.logger.error("Repo in invalid state. Attempting to auto-recover.")
+                resetCmd = ['git', 'reset', '--hard', '{0}^'.format(branchName)]
+                self.config.logger.error("Deleting last commit from this branch using, {0}".format(' '.join(resetCmd)))
+                try:
+                    subprocess.check_call(resetCmd)
+                except CalledProcessError:
+                    self.config.logger.error("Failed to reset branch. Aborting!")
+                    return (None, None)
+
+                commitHash = self.GetLastCommitHash(branchName=branchName)
+                hist = self.GetHistForCommit(commitHash=commitHash, branchName=branchName)
+
+                if hist is None:
+                    self.config.logger.error("Repo in invalid state. Please reset this branch to a previous commit with valid notes.")
+                    self.config.logger.error("  e.g. git reset --hard {0}~1".format(branchName))
+                    return (None, None)
 
             tr = hist.transactions[0]
             stream = accurev.show.streams(depot=depot, stream=stream.streamNumber, timeSpec=tr.id).streams[0]
@@ -799,13 +823,13 @@ class AccuRev2Git(object):
             return (None, None)
         endTr = endTrHist.transactions[0]
         self.config.logger.info("{0}: processing transaction range #{1} - #{2}".format(stream.name, tr.id, endTr.id))
-        
+
         deepHist = None
         if self.config.method == "deep-hist":
             ignoreTimelocks=True # The code for the timelocks is not tested fully yet. Once tested setting this to false should make the resulting set of transactions smaller
                                  # at the cost of slightly larger number of upfront accurev commands called.
-            self.config.logger.dbg("accurev.ext.deep_hist(depot={0}, stream={1}, timeSpec='{2}-{3}', ignoreTimelocks={4})".format(depot, stream.name, startTransaction, endTransaction, ignoreTimelocks))
-            deepHist = accurev.ext.deep_hist(depot=depot, stream=stream.name, timeSpec="{0}-{1}".format(startTransaction, endTransaction), ignoreTimelocks=ignoreTimelocks)
+            self.config.logger.dbg("accurev.ext.deep_hist(depot={0}, stream={1}, timeSpec='{2}-{3}', ignoreTimelocks={4})".format(depot, stream.name, tr.id, endTr.id, ignoreTimelocks))
+            deepHist = accurev.ext.deep_hist(depot=depot, stream=stream.name, timeSpec="{0}-{1}".format(tr.id, endTr.id), ignoreTimelocks=ignoreTimelocks)
             self.config.logger.info("Deep-hist returned {count} transactions to process.".format(count=len(deepHist)))
             if deepHist is None:
                 raise Exception("accurev.ext.deep_hist() failed to return a result!")
@@ -867,19 +891,19 @@ class AccuRev2Git(object):
                 commitHash = self.Commit(depot=depot, stream=stream, transaction=tr, branchName=branchName, isFirstCommit=False)
                 if commitHash is None:
                     if"nothing to commit" in self.gitRepo.lastStdout:
-                        self.config.logger.error( "diff info ({0} elements):".format(len(diff.elements)) )
+                        self.config.logger.dbg( "diff info ({0} elements):".format(len(diff.elements)) )
                         for element in diff.elements:
                             for change in element.changes:
-                                self.config.logger.error( "  what changed: {0}".format(change.what) )
-                                self.config.logger.error( "  original: {0}".format(change.stream1) )
-                                self.config.logger.error( "  new:      {0}".format(change.stream2) )
-                        self.config.logger.error( "deleted {0} files:".format(len(deletedPathList)) )
+                                self.config.logger.dbg( "  what changed: {0}".format(change.what) )
+                                self.config.logger.dbg( "  original: {0}".format(change.stream1) )
+                                self.config.logger.dbg( "  new:      {0}".format(change.stream2) )
+                        self.config.logger.dbg( "deleted {0} files:".format(len(deletedPathList)) )
                         for p in deletedPathList:
-                            self.config.logger.error( "  {0}".format(p) )
-                        self.config.logger.error( "populated {0} files:".format(len(popResult.elements)) )
+                            self.config.logger.dbg( "  {0}".format(p) )
+                        self.config.logger.dbg( "populated {0} files:".format(len(popResult.elements)) )
                         for e in popResult.elements:
-                            self.config.logger.error( "  {0}".format(e.location) )
-                        self.config.logger.info("Non-fatal error. Continuing.")
+                            self.config.logger.dbg( "  {0}".format(e.location) )
+                        self.config.logger.info("stream {0}: tr. #{1} is a no-op. Potential but unlikely error. Continuing.".format(stream.name, tr.id))
                     else:
                         break # Early return from processing this stream. Restarting should clean everything up.
                 else:
@@ -1306,7 +1330,9 @@ class AccuRev2Git(object):
             if self.config.git.finalize is not None and self.config.git.finalize:
                 self.StitchBranches()
             else:
+                self.gitRepo.raw_cmd([u'git', u'config', u'--local', u'gc.auto', u'0'])
                 self.ProcessStreams()
+                self.gitRepo.raw_cmd([u'git', u'config', u'--local', u'--unset-all', u'gc.auto'])
               
             if doLogout:
                 if accurev.logout():
@@ -1728,14 +1754,14 @@ def AccuRev2GitMain(argv):
             if args.checkMissingUsers:
                 PrintMissingUsers(state.config)
             state.config.logger.info("Restart:" if args.restart else "Start:")
-            state.config.logger.referenceTime = time.clock()
+            state.config.logger.referenceTime = datetime.now()
             rv = state.Start(isRestart=args.restart)
     else:
         PrintConfigSummary(state.config)
         if args.checkMissingUsers:
             PrintMissingUsers(state.config)
         state.config.logger.info("Restart:" if args.restart else "Start:")
-        state.config.logger.referenceTime = time.clock()
+        state.config.logger.referenceTime = datetime.now()
         rv = state.Start(isRestart=args.restart)
 
     return rv

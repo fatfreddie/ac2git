@@ -1,8 +1,8 @@
 ### Credits ###
 
-This tool was inspired by the work done by Ryan LaNeve in his https://github.com/rlaneve/accurev2git repository and the desire to improve it. Since this script is sufficiently different I have placed it in a separate repository here. I must also thank Tom Isaacson for his contribusion to the discussions about the tool and how it could be improved. You can find his fork of the original repo here https://github.com/parsley72/accurev2git.
+This tool was inspired by the work done by [Ryan LaNeve](https://github.com/rlaneve) in his https://github.com/rlaneve/accurev2git repository and the desire to improve it. Since this script is sufficiently different I have placed it in a separate repository here. I must also thank [Tom Isaacson](https://github.com/parsley72) for his contribusion to the discussions about the tool and how it could be improved. It was his work that prompted me to start on this implementation. You can find his fork of the original repo here https://github.com/parsley72/accurev2git.
 
-The algorithm used here was devised by Robert Smithson whose stated goal is to rid the multiverse of AccuRev since ridding just our verse is not good enough.
+The algorithm used here was devised by [Robert Smithson](https://github.com/fatfreddie) whose stated goal is to rid the multiverse of AccuRev since ridding just our verse is not good enough.
 
 My work is merely in the implementation and I humbly offer it to anyone who doesn't want to remain stuck with AccuRev.
 
@@ -28,6 +28,8 @@ AccuRev2Git is a tool to convert an AccuRev depot into a git repo. A specified A
 - `AccuRev 6.1.1 (2014/05/05)`, `git version 2.1.0` and `Python 2.7.8` on a Fedora 21 host.
 
 - `AccuRev 6.1.1 (2014/05/05)`, `git version 1.9.0.msysgit.0` and `Python 2.7.6` on a Window 7 host.
+
+- `Accurev 6.0`, `git 1.9.5` on a Windows 8.1 host. By [Gary](https://github.com/bigminer) in [this comment](https://github.com/orao/ac2git/issues/13#issuecomment-136392393) from issue #13.
 
 ### How to use ###
 
