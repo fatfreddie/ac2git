@@ -303,13 +303,15 @@ class AccuRev2Git(object):
 
     # Returns True if the path was deleted, otherwise false
     def DeletePath(self, path):
-        if os.path.exists(path):
-            if os.path.islink(path) or os.path.isfile(path):
+        if os.path.lexists(path):
+            if os.path.islink(path):
+                os.unlink(path)
+            elif os.path.isfile(path):
                 os.remove(path)
             elif os.path.isdir(path):
                 shutil.rmtree(path)
             
-        return not os.path.exists(path)
+        return not os.path.lexists(path)
    
     def ClearGitRepo(self):
         # Delete everything except the .git folder from the destination (git repo)
@@ -708,7 +710,7 @@ class AccuRev2Git(object):
                     if stream is not None and stream.name is not None:
                         name = stream.name.replace('\\', '/').lstrip('/')
                         path = os.path.join(self.gitRepo.path, name)
-                        if os.path.exists(path):
+                        if os.path.lexists(path): # Ensure that broken links are also deleted!
                             if not self.DeletePath(path):
                                 self.config.logger.error("Failed to delete '{0}'.".format(path))
                                 raise Exception("Failed to delete '{0}'".format(path))
