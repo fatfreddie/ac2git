@@ -2503,9 +2503,13 @@ class ext(object):
         #      Note: The keywords highest/now are translated w.r.t. the depot and not the stream.
         #            Otherwise we might miss later promotes to parent streams...
         if not isinstance(ts.start, int) and ts.start is not None:
-            ts.start = hist(depot=depot, timeSpec=ts.start, useCache=False).transactions[0].id
+            startHistory = hist(depot=depot, timeSpec=ts.start, useCache=False)
+            if startHistory is not None and startHistory.transactions is not None and len(startHistory.transactions) > 0:
+                ts.start = startHistory.transactions[0].id
         if not isinstance(ts.end, int) and ts.end is not None:
-            ts.end = hist(depot=depot, timeSpec=ts.end, useCache=False).transactions[0].id
+            endHistory = hist(depot=depot, timeSpec=ts.end, useCache=False)
+            if endHistory is not None and endHistory.transactions is not None and len(endHistory.transactions) > 0:
+                ts.end = endHistory.transactions[0].id
         #   2. If there is a limit set on the number of transactions convert it into a start and end without a limit...
         if ts.start is not None and ts.end is not None and ts.limit is not None:
             if ts.end is None or abs(ts.end - ts.start + 1) > ts.limit:
@@ -2548,8 +2552,11 @@ class ext(object):
                         # Make descending
                         timeSpec = timeSpec.reversed()
                     # Get the transaction number at the given time.
-                    preLockTr = hist(depot=depot, timeSpec=UTCDateTimeOrNone(timelock)).transactions[0]
-                    if timeSpec.start > preLockTr.id + 1:
+                    preLockHistory = hist(depot=depot, timeSpec=UTCDateTimeOrNone(timelock))
+                    if preLockHistory is None or preLockHistory.transactions is None or len(preLockHistory.transactions) == 0:
+                        return None
+                    preLockTr = preLockHistory.transactions[0]
+                    if preLockTr is None or timeSpec.start > preLockTr.id + 1:
                         return None
                     elif timeSpec.end > preLockTr.id:
                         timeSpec.end = preLockTr.id
@@ -2578,7 +2585,11 @@ class ext(object):
 
         # Since we don't know if this stream has been renamed in the past, we can't optimize this for the cache
         # like we do subsequently (by using Show.Streams(obj).getStream()).
-        streamInfo = show.streams(stream=stream, useCache=useCache).streams[0]
+        showStreams = show.streams(stream=stream, useCache=useCache)
+        if showStreams is not None and showStreams.streams is not None and len(showStreams.streams) > 0:
+            streamInfo = show.streams(stream=stream, useCache=useCache).streams[0]
+        else:
+            raise Exception("Error: assumption that the show streams returns a list doesn't hold. Aborting...")
 
         # Normalize the timeSpec
         # ======================
@@ -2597,7 +2608,7 @@ class ext(object):
             #   - The root stream number is always 1.
             #   - There is no mkstream transaction for the root stream.
             firstTr = hist(depot=depot, timeSpec="1", useCache=useCache)
-            if firstTr is None or len(firstTr.transactions) == 0:
+            if firstTr is None or firstTr.transactions is None or len(firstTr.transactions) == 0:
                 raise Exception("Error: assumption that the root stream has the same name as the depot doesn't hold. Aborting...")
             mkstreamTr = firstTr.transactions[0]
         else:
@@ -2664,23 +2675,25 @@ class ext(object):
                     # Add the parent stream's history to our own, recursively up the parent chain,
                     # for all of the transactions leading up to this `chstream` transaction.
                     parentTs = obj.TimeSpec(start=parentTs.start, end=(tr.id - 1))
-                    streamInfo = show.streams(depot=depot, stream=streamInfo.streamNumber, timeSpec=parentTs.start, useCache=useCache).streams[0]
-                    parentStream = streamInfo.basis
-                    if parentStream is not None:
-                        timelockTs = parentTs
-                        if not ignoreTimelocks:
-                            # If we are told to respect timelocks we need to make sure to adjust our time-spec to exclude any transactions that
-                            # the timelock would exclude. Sadly we need to manually model what Accurev does for timelocks in this command.
-                            # We only account for timelocks on the stream we are processing. The parent stream timelocks will be dealt with
-                            # through recursive invocations of this function.
-                            timelockTs = ext.restrict_timespec_to_timelock(depot=streamInfo.depotName, timeSpec=parentTs, timelock=streamInfo.time)
-                        
-                        # A None value for the _timelockTs_ indicates that the entire timespec is after the timelock, meaning that there are no useful transactions to process.
-                        if timelockTs is not None:
-                            # If there are useful transactions to process we will call deep_hist() on our parent stream and include the list of transactions returned
-                            # into our result.
-                            parentTrList = ext.deep_hist(depot=depot, stream=parentStream, timeSpec=timelockTs, ignoreTimelocks=ignoreTimelocks, useCache=useCache)
-                            trList.extend(parentTrList)
+                    showStreams = show.streams(depot=depot, stream=streamInfo.streamNumber, timeSpec=parentTs.start, useCache=useCache)
+                    if showStreams is not None and showStreams.streams is not None and len(showStreams.streams) > 0:
+                        streamInfo = showStreams.streams[0]
+                        parentStream = streamInfo.basis
+                        if parentStream is not None:
+                            timelockTs = parentTs
+                            if not ignoreTimelocks:
+                                # If we are told to respect timelocks we need to make sure to adjust our time-spec to exclude any transactions that
+                                # the timelock would exclude. Sadly we need to manually model what Accurev does for timelocks in this command.
+                                # We only account for timelocks on the stream we are processing. The parent stream timelocks will be dealt with
+                                # through recursive invocations of this function.
+                                timelockTs = ext.restrict_timespec_to_timelock(depot=streamInfo.depotName, timeSpec=parentTs, timelock=streamInfo.time)
+
+                            # A None value for the _timelockTs_ indicates that the entire timespec is after the timelock, meaning that there are no useful transactions to process.
+                            if timelockTs is not None:
+                                # If there are useful transactions to process we will call deep_hist() on our parent stream and include the list of transactions returned
+                                # into our result.
+                                parentTrList = ext.deep_hist(depot=depot, stream=parentStream, timeSpec=timelockTs, ignoreTimelocks=ignoreTimelocks, useCache=useCache)
+                                trList.extend(parentTrList)
                     # Here everything before the `chstream` transaction has already been processed with the deep-hist algorithm for all parents in the hierarchy
                     # and so we only need to run deep_hist() on our parent hierarchy for the remaining transactions, which are recorded in the _parentTs_ variable.
                     parentTs = obj.TimeSpec(start=tr.id, end=ts.end)
@@ -2691,15 +2704,17 @@ class ext(object):
         # Run the deep-hist algorithm on our parent stream (except if we are a snapshot stream) for the time-spec in _parentTs_ which represents
         # either the whole time-spec - if no `chstream` transactions occurred in the range - or the time-spec from the last `chstream` transaction
         # to the end of the original time-spec range.
-        streamInfo = show.streams(depot=depot, stream=streamInfo.streamNumber, timeSpec=parentTs.start, useCache=useCache).streams[0]
-        parentStream = streamInfo.basis
-        if parentStream is not None and streamInfo.Type != "snapshot":
-            timelockTs = parentTs
-            if not ignoreTimelocks:
-                timelockTs = ext.restrict_timespec_to_timelock(depot=streamInfo.depotName, timeSpec=parentTs, timelock=streamInfo.time)
-            if timelockTs is not None: # A None value indicates that the entire timespec is after the timelock.
-                parentTrList = ext.deep_hist(depot=depot, stream=parentStream, timeSpec=timelockTs, ignoreTimelocks=ignoreTimelocks, useCache=useCache)
-                trList.extend(parentTrList)
+        showStreams = show.streams(depot=depot, stream=streamInfo.streamNumber, timeSpec=parentTs.start, useCache=useCache)
+        if showStreams is not None and showStreams.streams is not None and len(showStreams.streams) > 0:
+            streamInfo = showStreams.streams[0]
+            parentStream = streamInfo.basis
+            if parentStream is not None and streamInfo.Type != "snapshot":
+                timelockTs = parentTs
+                if not ignoreTimelocks:
+                    timelockTs = ext.restrict_timespec_to_timelock(depot=streamInfo.depotName, timeSpec=parentTs, timelock=streamInfo.time)
+                if timelockTs is not None: # A None value indicates that the entire timespec is after the timelock.
+                    parentTrList = ext.deep_hist(depot=depot, stream=parentStream, timeSpec=timelockTs, ignoreTimelocks=ignoreTimelocks, useCache=useCache)
+                    trList.extend(parentTrList)
 
         rv = sorted(trList, key=lambda tr: tr.id)
         # Depending on the ordering of the provided time-spec return the transactions in the expected order (ascending/descending)
@@ -2714,12 +2729,18 @@ class ext(object):
     # which is returned by the hist() function.
     def affected_streams(depot, transaction, includeWorkspaces=True, ignoreTimelocks=False, doDiffs=False, useCache=False):
         if not isinstance(transaction, obj.Transaction):
-            transaction = hist(depot=depot, timeSpec=str(transaction), useCache=useCache).transactions[0]
+            transactionHist = hist(depot=depot, timeSpec=str(transaction), useCache=useCache)
+            if transactionHist is not None and transactionHist.transactions is not None and len(transactionHist.transactions) > 0:
+                transaction = transactionHist.transactions[0]
+            else:
+                return None
         
         rv = None
 
         destStreamNum = transaction.affectedStream()[1]
-        destStream = show.streams(depot=depot, stream=destStreamNum, timeSpec=transaction.id, useCache=useCache).streams[0].name
+        showStreams = show.streams(depot=depot, stream=destStreamNum, timeSpec=transaction.id, useCache=useCache)
+        if showStreams is not None and showStreams.streams is not None and len(showStreams.streams) > 0:
+            destStream = showStreams.streams[0].name
 
         if destStream is not None:
             streamMap = ext.stream_dict(depot=depot, transaction=transaction.id, useCache=useCache)
